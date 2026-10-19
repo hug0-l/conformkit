@@ -94,6 +94,20 @@ def _events(body):
             raise AssertionError(f"unexpected status 0x{status:02x}")
 
 
+def _track_by_name(smf, name):
+    """Return the events of the track whose FF 03 name event matches."""
+    for body in _track_bodies(smf):
+        events = list(_events(body))
+        if events and events[0][1] == 0xFF03 and events[0][2] == name.encode():
+            return events
+    raise AssertionError(f"no track named {name!r}")
+
+
+def _named_ticks(smf, name, status):
+    return [tick for tick, kind, _ in _track_by_name(smf, name)
+            if kind == status]
+
+
 def test_smf_ends_with_eot():
     smf = build_smf(el([ev()]), R25)
     tracks = _track_bodies(smf)
@@ -145,6 +159,118 @@ def test_write_midi(tmp_path):
     assert p.exists()
     assert p.stat().st_size == size
     assert p.read_bytes()[:4] == b"MThd"
+
+
+# --------------------------------------------------------------- text cues
+
+def test_text_cue_track_emits_text_events():
+    events = [ev(clip="SHOT_A", start=0), ev(clip="SHOT_B", start=250)]
+    smf = build_smf(el(events), R25,
+                    MidiSettings(note_track=False, text_cue_track=True))
+
+    cues = _track_by_name(smf, "text cues")
+    texts = [(tick, payload.decode()) for tick, kind, payload in cues
+             if kind == 0xFF01]
+
+    assert texts == [(0, "001 SHOT_A"), (19200, "002 SHOT_B")]
+    assert all(kind != 0xFF06 for _, kind, _ in cues)   # text, not markers
+
+
+def test_text_cue_prefix_follows_marker_name_index():
+    smf = build_smf(el([ev(clip="SHOT_A")]), R25,
+                    MidiSettings(note_track=False, text_cue_track=True,
+                                 marker_name_index=False))
+    texts = [payload.decode()
+             for _, kind, payload in _track_by_name(smf, "text cues")
+             if kind == 0xFF01]
+    assert texts == ["SHOT_A"]
+
+
+def test_text_cue_advance_moves_earlier_and_clamps():
+    events = [ev(clip=f"C{i}", start=start)
+              for i, start in enumerate((0, 25, 250), start=1)]
+    smf = build_smf(el(events), R25,
+                    MidiSettings(note_track=False, text_cue_track=True,
+                                 text_cue_advance_seconds=2.5))
+
+    # 2.5 s at 120 bpm / 960 ticks per quarter is 4800 ticks.
+    assert _named_ticks(smf, "text cues", 0xFF01) == [0, 0, 14400]
+
+
+def test_negative_text_cue_advance_is_rejected():
+    with pytest.raises(ValueError, match="text_cue_advance_seconds"):
+        build_smf(el([ev()]), R25,
+                  MidiSettings(text_cue_advance_seconds=-0.1))
+
+
+# --------------------------------------------------------------- pull-down
+
+def test_pull_down_shortens_marker_ticks():
+    settings = dict(note_track=False)
+    plain = build_smf(el([ev(start=250)]), R25, MidiSettings(**settings))
+    pulled = build_smf(el([ev(start=250)]), R25,
+                       MidiSettings(add_pull_down=True, **settings))
+
+    plain_tick = _named_ticks(plain, "markers", 0xFF06)[0]
+    pulled_tick = _named_ticks(pulled, "markers", 0xFF06)[0]
+
+    assert plain_tick == 19200                       # 10 s at 1920 ticks/s
+    assert pulled_tick == 19181                      # round(19200 * 1000/1001)
+    assert pulled_tick == round(plain_tick * 1000 / 1001)
+
+
+def test_pull_down_applies_to_every_generated_track():
+    kwargs = dict(marker_track=True, note_track=True, punch_track=True,
+                  streamer_track=True, text_cue_track=True,
+                  note_duration_of_event=True, marker_name_index=False)
+    events = [ev(clip="SHOT", start=250, dur=50)]
+    plain = build_smf(el(events), R25, MidiSettings(**kwargs))
+    pulled = build_smf(el(events), R25,
+                       MidiSettings(add_pull_down=True, **kwargs))
+
+    for name in ("markers", "cues", "punches", "streamers", "text cues"):
+        # compare that track's ticks with the same track in the pulled file
+        plain_track = _track_by_name(plain, name)
+        pulled_track = _track_by_name(pulled, name)
+        assert len(plain_track) == len(pulled_track)
+        for (plain_tick, plain_kind, _), (pulled_tick, pulled_kind, _) in zip(
+                plain_track, pulled_track):
+            assert plain_kind == pulled_kind
+            scaled = plain_tick * 1000 / 1001
+            assert pulled_tick <= plain_tick
+            assert pulled_tick == pytest.approx(scaled, abs=1.0)
+
+
+def test_disabled_settings_emit_no_text_cue_track():
+    smf = build_smf(el([ev()]), R25)
+
+    names = [list(_events(body))[0][2] for body in _track_bodies(smf)]
+    assert b"text cues" not in names
+    assert all(kind != 0xFF01 for body in _track_bodies(smf)
+               for _, kind, _ in _events(body))
+
+
+def test_disabled_pull_down_leaves_marker_ticks_unchanged():
+    events = [ev(start=250)]
+    default = build_smf(el(events), R25, MidiSettings(note_track=False))
+    explicit = build_smf(el(events), R25,
+                         MidiSettings(note_track=False, add_pull_down=False))
+    assert (_named_ticks(default, "markers", 0xFF06)
+            == _named_ticks(explicit, "markers", 0xFF06) == [19200])
+
+
+def test_text_cue_advance_combines_with_pull_down():
+    smf = build_smf(el([ev(clip="SHOT", start=250)]), R25,
+                    MidiSettings(note_track=False, text_cue_track=True,
+                                 text_cue_advance_seconds=1.0,
+                                 add_pull_down=True))
+
+    marker = _named_ticks(smf, "markers", 0xFF06)[0]
+    cue = _named_ticks(smf, "text cues", 0xFF01)[0]
+
+    assert marker == 19181
+    assert cue == marker - 1920      # a one-second advance, not itself pulled
+    assert cue == 17261
 
 
 # --------------------------------------------------------------- update

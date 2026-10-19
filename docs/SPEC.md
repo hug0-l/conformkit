@@ -286,8 +286,11 @@ Deterministic; previewable; undoable.
 
 ### 6.1 Standard
 
-AMWA AAF 2.0. Binary AAF is an OLE2 compound file whose objects are keyed by
-SMPTE Universal Labels. AAFX (XML) is the dependency-free interchange form.
+Binary AAF is AMWA AAF 2.0: an OLE2 compound file whose objects are keyed by
+SMPTE Universal Labels. The dependency-free XML form is AAF-XML v1.1, the AAF
+SDK's XML stored format: namespace
+`http://www.aafassociation.org/aafx/v1.1/20050628`, root `<AAF version="1.1">`.
+It is not a DAW interchange file; binary AAF remains that route.
 
 ### 6.2 Mapping
 
@@ -301,21 +304,23 @@ SMPTE Universal Labels. AAFX (XML) is the dependency-free interchange form.
 | Roll name | Mob name |
 | Clip name | Source mob name |
 | Marker | EventMobSlot |
-| Transition | OperationGroup |
+| Transition | not serialised; needs extension OperationDefinitions |
 
 ### 6.3 Element tags recognised on import
 
 ```
-EG EssenceGroup   FL Filler        NS NestedScope   OG OperationGroup
-PD Pulldown       SE Selector      SQ Sequence      SC SourceClip
-TR Transition     SR ScopeReference
+FL Filler         SQ Sequence      SC SourceClip
 ```
+
+Other components (for example `Transition` or `OperationGroup` in a third-party
+document) are consumed for their `ComponentLength` so later clips keep their
+positions, but they do not become events.
 
 ### 6.4 Data definitions
 
 ```
-Picture  Sound  LegacySound  Timecode  LegacyTimecode  Edgecode
-DescriptiveMetadata
+DataDef_Picture  DataDef_Sound  DataDef_LegacyPicture
+DataDef_LegacySound  DataDef_Timecode
 ```
 
 Unknown type: reject with a named error.

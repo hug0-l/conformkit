@@ -59,7 +59,8 @@ def write_binary_aaf(path: str, edit_list, rate,
     """Write an edit list as a binary AAF.
 
     Returns a summary dict with counts, so a caller can report what was written
-    without re-reading the file.
+    without re-reading the file. `trim_ends` is accepted for API compatibility
+    and has no effect: events are written exactly as the list defines them.
     """
     try:
         import aaf2
@@ -84,8 +85,27 @@ def write_binary_aaf(path: str, edit_list, rate,
     if not by_track:
         raise AafWriteError("list has no tracks")
 
-    written_events = 0
+    written_events: set[int] = set()
+    written_clips = 0
     written_tracks = 0
+
+    # A SourceMob must be per (source, media kind): one source name can appear
+    # on both a video and an audio track, and a single mob cannot serve both.
+    # Its one slot must also span the furthest point any clip reads, otherwise
+    # a clip's `start` points past the end of the mob it references.
+    extents: dict[tuple[str, str], int] = {}
+    for track_label, events in by_track.items():
+        kind = _media_kind(track_label)
+        for ev in events:
+            name = (ev.source_file or ev.clip_name
+                    or ev.roll_name or "source")
+            start = to_frames(ev.rec_in, rate)
+            length = to_frames(ev.rec_out, rate) - start
+            if length <= 0:
+                continue
+            extent = to_frames(ev.src_in, rate) + length
+            key = (name, kind)
+            extents[key] = max(extents.get(key, 0), extent)
 
     try:
         with aaf2.open(path, "w") as f:
@@ -93,8 +113,7 @@ def write_binary_aaf(path: str, edit_list, rate,
             comp.name = title or edit_list.title or "conformkit"
             f.content.mobs.append(comp)
 
-            # a source mob per distinct source name, reused across clips
-            sources: dict[str, object] = {}
+            sources: dict[tuple[str, str], object] = {}
 
             for slot_index, (track_label, events) in enumerate(
                     sorted(by_track.items()), start=1):
@@ -119,7 +138,8 @@ def write_binary_aaf(path: str, edit_list, rate,
 
                     src_name = (ev.source_file or ev.clip_name
                                 or ev.roll_name or "source")
-                    src_mob = sources.get(src_name)
+                    key = (src_name, kind)
+                    src_mob = sources.get(key)
                     if src_mob is None:
                         src_mob = f.create.SourceMob()
                         src_mob.name = src_name
@@ -147,27 +167,30 @@ def write_binary_aaf(path: str, edit_list, rate,
                             desc['VerticalSubsampling'].value = 1
                             desc['ImageAspectRatio'].value = '16/9'
                             desc['VideoLineMap'].value = [21, 584]
-                        desc['Length'].value = 0
+                        desc['Length'].value = extents.get(key, 0)
                         src_mob.descriptor = desc
-                        f.content.mobs.append(src_mob)
-                        sources[src_name] = src_mob
 
+                        # create the single slot up front, sized to the source
+                        # extent, so every clip can reference it
+                        if kind == "sound":
+                            src_slot = src_mob.create_sound_slot(rate_str)
+                        else:
+                            src_slot = src_mob.create_picture_slot(rate_str)
+                        src_slot.segment.length = extents.get(key, 0)
+
+                        f.content.mobs.append(src_mob)
+                        sources[key] = src_mob
+
+                    slot_id = int(src_mob.slots[0].slot_id)
                     clip = f.create.SourceClip(
-                        media_kind=kind, length=length)
+                        media_kind=kind, length=length,
+                        mob_id=src_mob.mob_id, slot_id=slot_id)
                     # SourceClip has no name property; the name lives on the
                     # SourceMob it refers to
-                    if not src_mob.slots:
-                        src_slot = src_mob.create_sound_slot(
-                            rate_str) if kind == "sound" \
-                            else src_mob.create_picture_slot(rate_str)
-                        src_slot.segment.length = length
-                        clip.slot_id = int(src_slot.slot_id)
-                    else:
-                        clip.slot_id = int(src_mob.slots[0].slot_id)
-
                     clip.start = to_frames(ev.src_in, rate)
                     sequence.components.append(clip)
-                    written_events += 1
+                    written_events.add(id(ev))
+                    written_clips += 1
                     cursor = start + length
 
     except AafWriteError:
@@ -176,11 +199,10 @@ def write_binary_aaf(path: str, edit_list, rate,
         raise AafWriteError(f"could not write AAF: {exc}") from exc
 
     return {
-        "events": written_events,
+        "events": len(written_events),
+        "clips": written_clips,
         "tracks": written_tracks,
-        "sources": 0 if not by_track else len({e.source_file or e.clip_name
-                                               for evs in by_track.values()
-                                               for e in evs}),
+        "sources": len(sources),
         "size": os.path.getsize(path),
         "rate": rate_str,
     }

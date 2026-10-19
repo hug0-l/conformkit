@@ -291,6 +291,7 @@ class PtxSession:
     sample_rate: int = 0
     plugins: list = field(default_factory=list)
     regions: list = field(default_factory=list)
+    audio_files: list = field(default_factory=list)
 
     @property
     def string_count(self) -> int:
@@ -379,13 +380,16 @@ def read_session(path: str) -> PtxSession:
     sess.track_names, sess.clip_names, sess.plugins = _names_from_blocks(
         plain, sess.blocks, sess.big_endian)
 
-    # --- region records: names and source indices are reliable, timing is
-    # best-effort and flagged per record
+    # --- region records: validated against the source file's real length
     try:
-        from .ptregions import extract_regions
+        from .ptregions import extract_audio_files, extract_regions
 
-        sess.regions = extract_regions(plain, sess.blocks, sess.big_endian)
+        sess.audio_files = extract_audio_files(plain, sess.blocks,
+                                               sess.big_endian)
+        sess.regions = extract_regions(plain, sess.blocks, sess.big_endian,
+                                       sess.audio_files)
     except Exception:                               # noqa: BLE001
+        sess.audio_files = []
         sess.regions = []
 
     # --- session metadata from the leading strings
@@ -447,13 +451,13 @@ _NAME_CONTENT = {
 _NAME_OFFSETS = (0, 1, 2, 3, 4, 6, 8, 12)
 
 
-def _pstring_at(data: bytes, off: int) -> str | None:
-    """A little-endian length-prefixed ASCII string, or None."""
+def _pstring_at(data: bytes, off: int, big_endian: bool = False) -> str | None:
+    """A length-prefixed ASCII string, or None."""
     import struct
 
     if off + 4 > len(data):
         return None
-    n = struct.unpack_from("<I", data, off)[0]
+    n = struct.unpack_from(">I" if big_endian else "<I", data, off)[0]
     if not (1 <= n <= 512) or off + 4 + n > len(data):
         return None
     body = data[off + 4:off + 4 + n]
@@ -483,7 +487,7 @@ def _names_from_blocks(data: bytes, blocks, big_endian: bool):
             continue
         name = None
         for d in _NAME_OFFSETS:
-            name = _pstring_at(data, b.payload_offset + d)
+            name = _pstring_at(data, b.payload_offset + d, big_endian)
             if name:
                 break
         if not name:

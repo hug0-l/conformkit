@@ -150,9 +150,13 @@ print(s.session_name, s.sample_rate, s.block_count)
 print(s.track_names[:5], s.plugins[:5])
 
 for r in s.regions[:5]:
-    # name and source are always right; timing carries a confidence rating
+    # sample_offset and length are validated against the real source file
     print(f"{r.name[:40]:<40} src={r.source_index} "
-          f"{r.length/48000:7.1f}s  {r.confidence}")
+          f"{r.duration_seconds:7.1f}s at offset {r.sample_offset:,}")
+
+for f in s.audio_files[:5]:
+    print(f"{f.name:<44} {f.length:>10,} samples "
+          f"@ {f.sample_rate} Hz / {f.channels} ch")
 ```
 
 Session writing is deliberately narrow: only **same-length name replacement on
@@ -165,6 +169,46 @@ report = write_clone("in.ptx", "out.ptx", {"Old Name": "New Name"})
 print(report.summary())   # "5 renamed, verified"
 ```
 
+### Session format, as verified
+
+The layout below is established from the files and checked against real audio,
+not taken on trust. Two independent sessions are used: a public demo that ships
+its own WAVs, and a 34 MB production Atmos session.
+
+**Decryption.** The first `0x14` bytes are plaintext. Byte `0x12` selects the
+key schedule, byte `0x13` seeds it:
+
+```
+delta = the i in 0..255 with (i * mul) & 0xFF == xor_value
+        mul = 53, positive, for type 0x01
+        mul = 11, negative, for type 0x05
+key[i]   = (i * delta) & 0xFF
+key index = off & 0xFF          for type 0x01
+          = (off >> 12) & 0xFF  for type 0x05
+```
+
+**Blocks.** `Z` (0x5A) at `pos`, u16 type at `+1`, u32 size at `+3`, u16 content
+type at `+7`. `size` counts from the content-type field, so a block ends at
+`pos + 7 + size`. Children sit inside the parent payload.
+
+**Audio files.** Names come from content type `0x103A`; the record with the
+length is `0x1001` nested under `0x1003`, in the same order.
+
+```
+0x1001 : +0 ct, +2 u32 sample rate, +6 u8 channels, +7 u8 bits,
+         +8 u64 length in samples
+```
+
+**Regions.** Content type `0x2629` (or `0x1008`) inside `0x262A` (or `0x100B`).
+Name length is a u32 at `payload+11`, name bytes at `payload+15`. A packed
+triple follows: field widths are the high nibbles of the three bytes at
+`base+1..+3`, and the values are **little-endian** starting at `base+5`, in the
+order `sample_offset, length, start`.
+
+The endianness is not a style choice — it is provable. Reading the triple
+big-endian leaves only 22% of regions inside their source file; little-endian
+gives 100%. That assertion is in the test suite.
+
 ---
 
 ## Format support
@@ -172,10 +216,10 @@ print(report.summary())   # "5 renamed, verified"
 | Format | Read | Write | Notes |
 |---|---|---|---|
 | CMX 3600 EDL | yes | yes | plus File16 / File32 / File129 |
-| AAFX 2.0 (XML) | yes | yes | dependency-free |
+| AAFX (XML) | yes | yes | private simplified schema, not standards-conformant |
 | Binary AAF (OLE2) | container + names | yes (via pyaaf2) | objects keyed by SMPTE UL |
 | FCP7 XML (`xmeml`) | partial | no | sequence / clipitem / file |
-| Pro Tools session (PTX/PTF/PTS) | identification, decryption, block tree, names, regions, embedded XML | name replacement only | AES-free XOR with a derived 256-byte key |
+| Pro Tools session (PTX/PTF/PTS) | identification, decryption, block tree, tracks, regions, audio files, embedded XML | name replacement only | AES-free XOR with a derived 256-byte key |
 | BWF / WAV | yes | no | `fmt `, `data`, `bext`, `iXML` |
 | MIDI (SMF type 1) | no | yes | markers, cues, punches, streamers |
 | PDF / text script | yes | n/a | PDF needs `pypdf` |
@@ -194,7 +238,7 @@ conformkit/
 ├── transforms.py   column text transform pipeline
 ├── compare.py      change list
 ├── match.py        roll / filename matching
-├── aaf.py          AAFX read/write, binary container identification
+├── aaf.py          private AAF XML read/write, binary container identification
 ├── aafwrite.py     binary AAF via pyaaf2 (optional)
 ├── cfb.py          MS-CFB (OLE2) reader
 ├── conform.py      re-conform planning
@@ -205,6 +249,7 @@ conformkit/
 ├── ptx.py          session identification and metadata
 ├── ptdecrypt.py    session body decryption
 ├── ptblocks.py     session block tree
+├── ptregions.py    session audio files and regions
 ├── ptwrite.py      safe same-length session edits
 ├── guimodel.py     Tk-free view model
 ├── gui/            desktop UI (app, panels, commands, widgets, dialogs)
@@ -251,6 +296,13 @@ What the suite actually proves:
   partial list.
 - **Container integrity**: AAF output is a well-formed compound file, read back
   by our own independent CFB implementation.
+- **Ground-truth validation against real audio**: a public demo session ships
+  its own WAVs, so every region's `sample_offset + length` is checked against
+  the actual file length, and every file length in the session is checked
+  against the WAV header. Both must match exactly.
+- **Endianness pinned by evidence**: the same test asserts that reading the
+  packed triple big-endian *breaks* the bound wholesale, so the little-endian
+  choice is proven rather than assumed.
 - **Structural verification** for decryption: a wrong key yields no block
   chain at all, so the test asserts that blocks tile the file without gaps.
 - **Transactional updates**: a mid-way failure leaves the list untouched.
@@ -288,16 +340,18 @@ Everything is off the UI thread with progress reporting.
 
 - Binary session writing is **name replacement only**; sessions are never
   synthesized.
-- Binary AAF export needs `pyaaf2`; AAFX is always available.
+- Binary AAF export needs `pyaaf2`; AAFX is always available. AAFX here is a
+  private simplified XML schema that round-trips with conformkit only — it is
+  not standards-conformant AAF XML and is not claimed to be readable by other
+  tools.
 - FCP7 XML import is partial; export is not implemented.
 - No DAW automation: re-conform produces a plan and a new list, and leaves
   applying it to the operator.
-- Session region **timing** is decoded with a confidence rating: about 23% of
-  records resolve unambiguously in a production Atmos session, 74% have more
-  than one plausible interpretation, and 3% none. Those records still carry
-  their name and source index. Nothing downstream relies on low-confidence
-  timing.
-- Region *names* and source indices are reliable for every record.
+- Session region **timing** is decoded and validated: every region's
+  `sample_offset + length` is checked against the real source-file length, and
+  holds for 100% of records in both test sessions. `start` (the third packed
+  value) is reported but its meaning is not established, so nothing uses it.
+- Session writing is **name replacement only**; sessions are never synthesized.
 
 ---
 

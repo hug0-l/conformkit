@@ -79,7 +79,9 @@ RATES = {
 
 
 def rate_for(label: str, df: bool = False) -> Rate:
-    key = f"{label}df" if df and f"{label}df" in RATES else label
+    if df and f"{label}df" not in RATES:
+        raise TCError(label, "frame rate has no drop-frame variant")
+    key = f"{label}df" if df else label
     try:
         return RATES[key]
     except KeyError:
@@ -98,6 +100,10 @@ class Timecode:
 
 
 def _check(tc: Timecode, rate: Rate, token: str) -> Timecode:
+    if tc.hh < 0 or tc.mm < 0 or tc.ss < 0 or tc.ff < 0:
+        raise TCError(token, "negative timecode field")
+    if tc.hh > 99:
+        raise TCError(token, "hours exceed 99")
     if tc.mm > 59 or tc.ss > 59:
         raise TCError(token, "minutes/seconds out of range")
     if tc.ff >= rate.nominal:
@@ -123,11 +129,13 @@ def parse_tc(text: str, rate: Rate) -> Timecode:
 
 
 def format_tc(tc: Timecode, rate: Rate) -> str:
+    _check(tc, rate, str(tc))
     sep = ";" if rate.df else ":"
     return f"{tc.hh:02d}:{tc.mm:02d}:{tc.ss:02d}{sep}{tc.ff:02d}"
 
 
 def to_frames(tc: Timecode, rate: Rate) -> int:
+    _check(tc, rate, str(tc))
     total_min = tc.hh * 60 + tc.mm
     base = ((tc.hh * 3600 + tc.mm * 60 + tc.ss) * rate.nominal) + tc.ff
     if rate.df:

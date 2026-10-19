@@ -1,10 +1,12 @@
-"""AAF export as AAFX (AAF 2.0 XML interchange).
+"""Dependency-free AAF interchange as simplified XML.
 
-Writing binary AAF requires the AAF SDK. AAFX is the standardised XML form of
-the same object model and is sufficient for interchange with Pro Tools, Nuendo
-and Resolve. Namespace:
-
-    http://www.amwa.tv/aafx/v2.0/20200101
+Binary AAF needs the AAF SDK (see `aafwrite`). This module emits a **private,
+simplified XML representation** of an edit list: composition, timeline slots,
+filler and source clips, with source names as attributes. It uses an AAF-shaped
+namespace but does not implement the AAF object model (no `SourceMob`, `MobID`,
+`DataDefinition`, `OperationGroup` or transitions), so treat it as a
+conformkit-to-conformkit interchange format rather than standards-conformant
+AAFX. Reading third-party AAF XML is not supported.
 
 Track placement rule (documented here, derived from required behaviour):
   - clips are placed on the lowest-numbered track of their kind that has no

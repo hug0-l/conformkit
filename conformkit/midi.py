@@ -89,6 +89,8 @@ def _track_chunk(track: MidiTrack) -> bytes:
 
     last = 0
     for ev in sorted(track.events, key=lambda e: e.tick):
+        if ev.tick < 0:
+            raise ValueError("midi event tick cannot be negative")
         delta = max(0, ev.tick - last)
         last = ev.tick
         body += _vlq(delta)
@@ -122,6 +124,14 @@ def frames_to_ticks(frames: int, rate) -> int:
 def build_smf(edit_list, rate, settings: MidiSettings | None = None) -> bytes:
     """Build a type-1 SMF from an edit list."""
     settings = settings or MidiSettings()
+
+    for label, value in (("note_number", settings.note_number),
+                         ("punch_number", settings.punch_number)):
+        if not 0 <= int(value) <= 127:
+            raise ValueError(f"{label} must be 0..127, got {value!r}")
+    if not 0 <= int(settings.streamer_channel) <= 15:
+        raise ValueError("streamer_channel must be 0..15")
+
     tracks: list[MidiTrack] = []
 
     # tempo + time signature on the conductor track
@@ -149,8 +159,11 @@ def build_smf(edit_list, rate, settings: MidiSettings | None = None) -> bytes:
         tr = MidiTrack(name="cues")
         for ev in edit_list:
             start = track_ticks(ev)
-            span = _frames(ev.rec_in, rate) if settings.note_duration_of_event \
-                else settings.note_frames
+            if settings.note_duration_of_event:
+                # the event's own length, not its absolute position
+                span = (_frames(ev.rec_out, rate) - _frames(ev.rec_in, rate))
+            else:
+                span = settings.note_frames
             length = frames_to_ticks(max(1, span), rate)
             tr.events.append(MidiEvent(start, "note_on",
                                        bytes([0x90, settings.note_number, 100])))

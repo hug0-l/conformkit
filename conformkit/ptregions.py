@@ -1,28 +1,25 @@
-"""Pro Tools session regions.
+"""Pro Tools session audio files and regions.
 
-A session stores audio regions (clips): each has a name, a source file, and a
-position and length within that source. Names and source indices decode
-reliably. The timing triple does not, for every record, because some sessions
-use a different record layout that could not be pinned down.
+Two things live here:
 
-Rather than guess, this module decodes every plausible interpretation and
-reports a **confidence** per region:
+* **Audio files.** The session lists every source file with its sample rate,
+  channel count, bit depth and length in samples. Names come from the
+  ``0x103A`` block; the per-file record with the length is the ``0x1001`` block
+  nested under ``0x1003`` entries of the same ``0x1004`` list, in the same
+  order.
 
-    high   the encoding is unambiguous, or the per-source file-length bound
-           eliminated every other candidate
-    low    more than one interpretation survived; a value is reported but
-           should not be trusted for automated conform work
-    none   no interpretation survived; name and source index are still valid
+* **Regions.** Each region carries a name, a source file index, and three
+  packed integers: ``sample_offset``, ``length`` and ``start``.
 
-The disambiguation is principled, not heuristic:
+The packed integers are **little-endian**, and the field widths come from the
+high nibble of three bytes at the record's triple base. Getting the endianness
+wrong is invisible until you check the result against the audio: with
+big-endian decoding only ~22% of regions fit inside their source file, while
+little-endian gives 100%. That check is part of the test suite.
 
-1. **Minimal encoding.** Packed integers are written without redundant leading
-   zero bytes, so a candidate whose field starts with 0x00 is wrong.
-2. **File bound.** A region's `[start, start+length)` must lie inside its source
-   file. Bounds are bootstrapped from the unambiguous records, then used to
-   reject candidates that overrun.
-
-This is read-only. Nothing here writes to a session.
+``sample_offset`` and ``length`` are validated: a region must satisfy
+``sample_offset + length <= source length``. ``start`` is reported but its
+meaning is not established, so it is not used for anything.
 """
 from __future__ import annotations
 
@@ -30,9 +27,11 @@ import struct
 from dataclasses import dataclass, field
 
 __all__ = [
-    "RegionError", "Region", "PlaylistEntry", "extract_regions",
-    "extract_playlists", "samples_to_timecode", "REGION_LIST_TYPES",
-    "REGION_TYPES", "CONFIDENCE_HIGH", "CONFIDENCE_LOW", "CONFIDENCE_NONE",
+    "RegionError", "AudioFile", "Region", "PlaylistEntry",
+    "extract_audio_files", "extract_regions", "extract_playlists",
+    "samples_to_timecode", "REGION_LIST_TYPES", "REGION_TYPES",
+    "AUDIO_FILE_LIST_TYPE", "AUDIO_NAME_TYPE", "AUDIO_INFO_TYPE",
+    "AUDIO_META_TYPE",
 ]
 
 
@@ -40,20 +39,31 @@ class RegionError(ValueError):
     pass
 
 
+AUDIO_FILE_LIST_TYPE = 0x1004
+AUDIO_NAME_TYPE = 0x103A
+AUDIO_META_TYPE = 0x1003
+AUDIO_INFO_TYPE = 0x1001
+
 REGION_LIST_TYPES = {0x100B, 0x262A}
 REGION_TYPES = {0x1008, 0x2629}
 PLAYLIST_TYPE = 0x1004
 
-CONFIDENCE_HIGH = "high"
-CONFIDENCE_LOW = "low"
-CONFIDENCE_NONE = "none"
-
-# A sample count above this is a misparse, not a real recording: 48 kHz for 8 h.
 MAX_SAMPLES = 48_000 * 60 * 60 * 8
 
-# Offsets the triple has been observed at, relative to the end of the name.
-# 0 is the documented position; the others cover records with extra fields.
-_CANDIDATE_DELTAS = (0, -1, -2, -3, -4, 1, 2, 3)
+
+@dataclass
+class AudioFile:
+    index: int
+    name: str = ""
+    sample_rate: int = 0
+    channels: int = 0
+    bits: int = 0
+    length: int = 0                 # samples
+    block_offset: int = 0
+
+    @property
+    def duration_seconds(self) -> float:
+        return self.length / self.sample_rate if self.sample_rate else 0.0
 
 
 @dataclass
@@ -63,16 +73,13 @@ class Region:
     source_index: int = -1
     sample_offset: int = 0
     length: int = 0
-    start: int = 0
-    confidence: str = CONFIDENCE_NONE
-
-    @property
-    def reliable(self) -> bool:
-        return self.confidence == CONFIDENCE_HIGH
+    start: int = 0                  # reported, meaning not established
+    # None = not checked; True/False = the source-file bound was applied
+    reliable: bool | None = None
 
     @property
     def end(self) -> int:
-        return self.start + self.length
+        return self.sample_offset + self.length
 
     @property
     def duration_seconds(self) -> float:
@@ -94,7 +101,42 @@ def _u32(data: bytes, off: int, big_endian: bool) -> int:
     return struct.unpack_from(">I" if big_endian else "<I", data, off)[0]
 
 
-def _name_at(data: bytes, off: int, big_endian: bool):
+def _u64(data: bytes, off: int, big_endian: bool) -> int:
+    if off < 0 or off + 8 > len(data):
+        return -1
+    return struct.unpack_from(">Q" if big_endian else "<Q", data, off)[0]
+
+
+def _decode_triple(data: bytes, base: int, big_endian: bool = False):
+    """Decode the packed (sample_offset, length, start).
+
+    The width-selector bytes are at different positions depending on the
+    session's endianness: ``base+1..+3`` for a little-endian session and
+    ``base+4..+2`` (reversed) for a big-endian one, matching libptformat. The
+    values themselves are always little-endian.
+    """
+    if base < 0 or base + 5 > len(data):
+        return None
+
+    order = (4, 3, 2) if big_endian else (1, 2, 3)
+    widths = [(data[base + i] & 0xF0) >> 4 for i in order]
+    if any(w > 5 for w in widths) or sum(widths) == 0:
+        return None
+
+    values = []
+    pos = base + 5
+    for w in widths:
+        if w == 0:
+            values.append(0)
+            continue
+        if pos + w > len(data):
+            return None
+        values.append(int.from_bytes(data[pos:pos + w], "little"))
+        pos += w
+    return values[0], values[1], values[2]
+
+
+def _region_name(data: bytes, off: int, big_endian: bool):
     n = _u32(data, off, big_endian)
     if not (1 <= n <= 512) or off + 4 + n > len(data):
         return None
@@ -104,130 +146,130 @@ def _name_at(data: bytes, off: int, big_endian: bool):
     return body.decode("ascii", "replace")
 
 
-def _decode_at(data: bytes, base: int):
-    """Decode the triple at `base`.
+# --------------------------------------------------------------- audio files
 
-    Returns (sample_offset, length, start, minimal) or None.
-    """
-    if base < 0 or base + 5 > len(data):
-        return None
+def extract_audio_files(data: bytes, blocks, big_endian: bool) -> list[AudioFile]:
+    """Recover the session's source files with their lengths."""
+    from .ptblocks import walk
 
-    widths = [(data[base + i] & 0xF0) >> 4 for i in (1, 2, 3)]
-    if any(w > 5 for w in widths) or sum(widths) == 0:
-        return None
+    out: list[AudioFile] = []
 
-    values = []
-    minimal = True
-    pos = base + 5
-    for w in widths:
-        if w == 0:
-            values.append(0)
+    for _, root in walk(blocks):
+        if root.content_type != AUDIO_FILE_LIST_TYPE:
             continue
-        if pos + w > len(data):
-            return None
-        raw = data[pos:pos + w]
-        if raw[0] == 0:                 # redundant leading zero: wrong base
-            minimal = False
-        values.append(int.from_bytes(raw, "big"))
-        pos += w
 
-    return values[0], values[1], values[2], minimal
+        names: list[str] = []
+        for child in root.children:
+            if child.content_type != AUDIO_NAME_TYPE:
+                continue
+            payload = data[child.payload_offset:child.end]
+            if len(payload) < 15:
+                continue
+            count = _u32(data, child.payload_offset + 7, big_endian)
+            header_len = _u32(data, child.payload_offset + 11, big_endian)
+            pos = 15 + header_len
+            # the per-record prefix is a fixed 9 bytes in this generation
+            while len(names) < count and pos + 13 <= len(payload):
+                n = _u32(payload, pos + 9, big_endian)
+                if not (1 <= n <= 512) or pos + 13 + n > len(payload):
+                    break
+                names.append(
+                    payload[pos + 13:pos + 13 + n].decode("utf-8", "replace"))
+                pos += 13 + n
 
+        records = []
+        for child in root.children:
+            if child.content_type != AUDIO_META_TYPE:
+                continue
+            for grand in child.children:
+                if grand.content_type == AUDIO_INFO_TYPE:
+                    base = grand.payload_offset
+                    if base + 16 > len(data):
+                        break
+                    records.append((
+                        _u32(data, base + 2, big_endian),
+                        data[base + 6],
+                        data[base + 7],
+                        _u64(data, base + 8, big_endian),
+                        grand.offset,
+                    ))
+                    break
 
-def _plausible(sample_offset: int, length: int, start: int) -> bool:
-    return (0 < length <= MAX_SAMPLES
-            and 0 <= start <= MAX_SAMPLES
-            and 0 <= sample_offset <= MAX_SAMPLES)
+        for i, (rate, channels, bits, length, off) in enumerate(records):
+            out.append(AudioFile(
+                index=i,
+                name=names[i] if i < len(names) else "",
+                sample_rate=rate, channels=channels, bits=bits,
+                length=length, block_offset=off,
+            ))
+        break
+    return out
 
 
 # --------------------------------------------------------------- regions
 
-def extract_regions(data: bytes, blocks, big_endian: bool) -> list[Region]:
-    """Decode every region record, with a confidence rating per record.
-
-    Every region with a readable name is returned. Records whose timing cannot
-    be established are returned with `confidence="none"`, so the name and
-    source index are never lost.
-    """
+def extract_regions(data: bytes, blocks, big_endian: bool,
+                    files: list[AudioFile] | None = None) -> list[Region]:
+    """Decode every region, validated against the source file when known."""
     from .ptblocks import walk
 
-    raw: list[tuple[Region, list]] = []
+    out: list[Region] = []
 
     for _, parent in walk(blocks):
         if parent.content_type not in REGION_LIST_TYPES:
             continue
-        for region in parent.children:
-            if region.content_type not in REGION_TYPES:
+        for record in parent.children:
+            if record.content_type not in REGION_TYPES:
                 continue
 
-            name = _name_at(data, region.payload_offset + 11, big_endian)
+            name = _region_name(data, record.payload_offset + 11, big_endian)
             if not name:
                 continue
 
-            child = region.children[0] if region.children else None
+            child = record.children[0] if record.children else None
             source_index = (
                 _u32(data, child.offset + 7 + child.block_size, big_endian)
                 if child else -1)
 
-            base = region.payload_offset + 15 + len(name)
-            candidates = []
-            for delta in _CANDIDATE_DELTAS:
-                decoded = _decode_at(data, base + delta)
-                if decoded is None:
-                    continue
-                so, ln, st, minimal = decoded
-                if minimal and _plausible(so, ln, st):
-                    candidates.append((so, ln, st))
-
-            raw.append((Region(name=name, block_offset=region.offset,
-                               source_index=source_index), candidates))
-
-    # --- bootstrap a file-length bound per source from unambiguous records
-    bounds: dict[int, int] = {}
-    for region, candidates in raw:
-        if len(candidates) == 1:
-            _, length, start = candidates[0]
-            bounds[region.source_index] = max(
-                bounds.get(region.source_index, 0), start + length)
-
-    # --- resolve
-    out: list[Region] = []
-    for region, candidates in raw:
-        if not candidates:
-            out.append(region)
-            continue
-
-        if len(candidates) == 1:
-            so, ln, st = candidates[0]
-            region.sample_offset, region.length, region.start = so, ln, st
-            region.confidence = CONFIDENCE_HIGH
-            out.append(region)
-            continue
-
-        bound = bounds.get(region.source_index, 0)
-        if bound:
-            fits = [c for c in candidates if c[2] + c[1] <= bound * 1.02]
-            if len(fits) == 1:
-                so, ln, st = fits[0]
-                region.sample_offset, region.length, region.start = so, ln, st
-                region.confidence = CONFIDENCE_HIGH
-                out.append(region)
+            decoded = _decode_triple(data, record.payload_offset + 15 + len(name),
+                                     big_endian)
+            if decoded is None:
+                out.append(Region(name=name, block_offset=record.offset,
+                                  source_index=source_index))
                 continue
-            if fits:
-                candidates = fits
 
-        so, ln, st = candidates[0]
-        region.sample_offset, region.length, region.start = so, ln, st
-        region.confidence = CONFIDENCE_LOW
-        out.append(region)
+            sample_offset, length, start = decoded
+            if not (0 < length <= MAX_SAMPLES):
+                out.append(Region(name=name, block_offset=record.offset,
+                                  source_index=source_index))
+                continue
 
+            # Only claim `reliable` when a real source length was available to
+            # check against. No source, no verdict.
+            reliable: bool | None = None
+            if files and 0 <= source_index < len(files):
+                source = files[source_index]
+                if source.length:
+                    reliable = (sample_offset + length <= source.length
+                                and sample_offset <= source.length)
+
+            out.append(Region(
+                name=name, block_offset=record.offset,
+                source_index=source_index,
+                sample_offset=sample_offset, length=length, start=start,
+                reliable=reliable,
+            ))
     return out
 
 
 # --------------------------------------------------------------- playlists
 
 def extract_playlists(data: bytes, blocks, big_endian: bool) -> list[PlaylistEntry]:
-    """Decode playlist entries: which region sits on which track slot."""
+    """Decode playlist entries: which region sits on which track slot.
+
+    Reported for completeness; the mapping is not used by the library because
+    the placement fields are not established.
+    """
     from .ptblocks import walk
 
     out: list[PlaylistEntry] = []
@@ -235,7 +277,7 @@ def extract_playlists(data: bytes, blocks, big_endian: bool) -> list[PlaylistEnt
         if playlist.content_type != PLAYLIST_TYPE:
             continue
         for slot_index, slot in enumerate(playlist.children):
-            if slot.content_type != 0x1003:
+            if slot.content_type != AUDIO_META_TYPE:
                 continue
             for entry in slot.children:
                 idx = _u32(data, entry.payload_offset + 2, big_endian)

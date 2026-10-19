@@ -57,26 +57,36 @@ class WavInfo:
         return self.duration_frames / self.sample_rate
 
 
+_KNOWN_CHUNKS = {
+    b"fmt ", b"data", b"fact", b"bext", b"iXML", b"LIST", b"cue ", b"smpl",
+    b"inst", b"JUNK", b"PAD ", b"minf", b"elm1", b"regn", b"umid", b"axml",
+    b"ID3 ", b"id3 ", b"afsp", b"CSET", b"PEAK",
+}
+
+
 def _find_chunks(data: bytes) -> dict[str, bytes]:
     """Walk RIFF chunks.
 
     Chunks are word-aligned, but files in the wild sometimes omit the pad byte
-    on an odd-length chunk. The walker tries the aligned position first and
-    falls back to the unaligned one when the aligned position does not begin a
-    printable four-character chunk id.
+    on an odd-length chunk. The walker scores the aligned and unaligned
+    positions and prefers a known chunk id over a merely printable one: a
+    shifted id such as ``ata0`` is printable, so printability alone would skip
+    the real next chunk.
     """
     if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise WavError("not a RIFF/WAVE file")
 
-    def valid_id(off: int) -> bool:
+    def id_score(off: int) -> int:
         if off + 8 > len(data):
-            return False
+            return 0
         cid = data[off:off + 4]
         if not all((48 <= c <= 57) or (65 <= c <= 90) or (97 <= c <= 122)
                    or c == 32 for c in cid):
-            return False
+            return 0
         size = int.from_bytes(data[off + 4:off + 8], "little")
-        return off + 8 + size <= len(data) + 1
+        if off + 8 + size > len(data) + 1:
+            return 0
+        return 2 if cid in _KNOWN_CHUNKS else 1
 
     out: dict[str, bytes] = {}
     off = 12
@@ -91,9 +101,9 @@ def _find_chunks(data: bytes) -> dict[str, bytes]:
 
         aligned = body_start + size + (size & 1)
         unaligned = body_start + size
-        if valid_id(aligned):
+        if id_score(aligned) >= id_score(unaligned) and id_score(aligned):
             off = aligned
-        elif valid_id(unaligned):
+        elif id_score(unaligned):
             off = unaligned
         else:
             off = aligned
@@ -101,8 +111,10 @@ def _find_chunks(data: bytes) -> dict[str, bytes]:
 
 
 def _parse_bext(b: bytes, info: WavInfo) -> None:
+    # A short bext is truncated, not fatal: pad it so the fmt/data chunks are
+    # still reported rather than losing the whole file.
     if len(b) < 602:
-        raise WavError("bext chunk too short")
+        b = b.ljust(602, b"\x00")
     info.bext_description = b[0:256].split(b"\x00")[0].decode("ascii", "replace").strip()
     info.bext_originator = b[256:288].split(b"\x00")[0].decode("ascii", "replace").strip()
     info.bext_originator_ref = b[288:320].split(b"\x00")[0].decode("ascii", "replace").strip()

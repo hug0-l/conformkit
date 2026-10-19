@@ -118,12 +118,30 @@ def decrypt_file(path: str) -> tuple[bytes, XorParams]:
 
 
 def is_decrypted(data: bytes) -> bool:
-    """True when the body already reads as plaintext.
+    """True when the body reads as a plaintext block chain.
 
-    The session block tree is a chain of 'Z'-marked blocks, so a decrypted body
-    contains many 0x5A bytes at block boundaries; an encrypted body does not.
+    A byte histogram cannot answer this: random data contains 0x5A at about
+    1/256, which is well above any useful `Z`-count threshold, and XOR output
+    has a similar distribution. The only reliable test is structural — walk the
+    top-level chain and require it to start at 0x1F, tile without gaps, and
+    reach the end of the file.
     """
     if len(data) <= PLAINTEXT_HEADER:
         return True
-    body = data[PLAINTEXT_HEADER:]
-    return body.count(b"\x5a") > len(body) // 2000
+
+    from .ptblocks import HEADER_SIZE, _read_block
+
+    big_endian = bool(data[0x11])
+    pos = 0x1F
+    blocks = 0
+    end = len(data)
+    while pos + HEADER_SIZE <= end:
+        block = _read_block(data, pos, end, big_endian)
+        if block is None:
+            return False
+        pos = block.end
+        blocks += 1
+        if blocks > 1_000_000:
+            return False
+    # a real session ends on a block boundary; allow a few trailing bytes
+    return blocks >= 2 and end - pos <= 8

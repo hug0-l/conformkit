@@ -1,5 +1,7 @@
 # conformkit
 
+[![tests](https://github.com/hug0-l/conformkit/actions/workflows/test.yml/badge.svg)](https://github.com/hug0-l/conformkit/actions/workflows/test.yml)
+
 **Status: alpha.** The format layer is well tested; the desktop UI is usable but
 still gaining features. Expect API changes before 1.0.
 
@@ -44,6 +46,19 @@ pip install -e ".[dev]"    # pytest
 ```
 
 Python 3.10+. The core installs nothing.
+
+---
+
+## Development
+
+```bash
+python -m pip install -e ".[aaf,pdf,dev]"
+python -m pytest tests -q
+```
+
+`fixtures/` and `work/` are gitignored, so tests that need production
+material skip on a clean checkout. The public fixture corpus can be fetched
+with `bash scripts/fetch_fixtures.sh`.
 
 ---
 

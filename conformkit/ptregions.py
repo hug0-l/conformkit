@@ -20,18 +20,33 @@ little-endian gives 100%. That check is part of the test suite.
 ``sample_offset`` and ``length`` are validated: a region must satisfy
 ``sample_offset + length <= source length``. ``start`` is reported but its
 meaning is not established, so it is not used for anything.
+
+Timeline placement lives in a separate map, not on the region record:
+
+    0x1054  region->track full map
+      0x1052  one map entry, carrying the track name
+        0x1050  one placement
+          0x104f  the placement payload
+
+Each ``0x104f`` payload has a region index (u32) at ``+2`` and a 40-bit
+position at ``+7``. Byte ``+14`` carries the position unit: bit 6 clear means
+the position is in samples, bit 6 set means it is in ticks relative to
+``ZERO_TICKS``. Sample positions are validated against the session extent and
+against the source order of split regions. Tick positions are reported raw;
+converting them to samples needs the session tempo map, which is not decoded.
 """
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 __all__ = [
-    "RegionError", "AudioFile", "Region", "PlaylistEntry",
+    "RegionError", "AudioFile", "Region", "PlaylistPlacement",
     "extract_audio_files", "extract_regions", "extract_playlists",
     "samples_to_timecode", "REGION_LIST_TYPES", "REGION_TYPES",
     "AUDIO_FILE_LIST_TYPE", "AUDIO_NAME_TYPE", "AUDIO_INFO_TYPE",
-    "AUDIO_META_TYPE",
+    "AUDIO_META_TYPE", "PLAYLIST_MAP_TYPE", "TIMELINE_UNIT_SAMPLES",
+    "TIMELINE_UNIT_TICKS", "ZERO_TICKS",
 ]
 
 
@@ -46,7 +61,19 @@ AUDIO_INFO_TYPE = 0x1001
 
 REGION_LIST_TYPES = {0x100B, 0x262A}
 REGION_TYPES = {0x1008, 0x2629}
-PLAYLIST_TYPE = 0x1004
+
+# v8/v10 region->track map. 0x1054 is the full map, 0x1052 a per-track map
+# entry, 0x1050 a placement, and 0x104f the placement payload.
+PLAYLIST_MAP_TYPE = 0x1054
+PLAYLIST_TRACK_TYPE = 0x1052
+PLAYLIST_ENTRY_TYPE = 0x1050
+PLAYLIST_SUBENTRY_TYPE = 0x104F
+
+# Pro Tools stores tick-based positions as a 1e12 offset plus the tick count.
+ZERO_TICKS = 0xE8D4A51000
+
+TIMELINE_UNIT_SAMPLES = "samples"
+TIMELINE_UNIT_TICKS = "ticks"
 
 MAX_SAMPLES = 48_000 * 60 * 60 * 8
 
@@ -87,10 +114,26 @@ class Region:
 
 
 @dataclass
-class PlaylistEntry:
-    track_index: int
+class PlaylistPlacement:
+    """One placement in the session's region->track map.
+
+    ``position`` is the value as stored: a sample count when ``unit`` is
+    ``"samples"``, or an absolute tick count when ``unit`` is ``"ticks"``.
+    ``timeline_start`` is only set for sample units, because tick-to-sample
+    conversion needs the tempo map. A region can appear more than once (for
+    example once per channel of a multichannel track), so placements are a
+    list, not a field on `Region`. ``playlist_offset`` identifies the
+    ``0x1052`` map entry, since distinct entries can share a track name.
+    """
+    track_name: str
     region_index: int
     block_offset: int
+    position: int
+    playlist_offset: int = 0
+    unit: str = TIMELINE_UNIT_SAMPLES
+    region_name: str = ""
+    timeline_start: int | None = None
+    timeline_ticks: int | None = None
 
 
 # --------------------------------------------------------------- primitives
@@ -105,6 +148,13 @@ def _u64(data: bytes, off: int, big_endian: bool) -> int:
     if off < 0 or off + 8 > len(data):
         return -1
     return struct.unpack_from(">Q" if big_endian else "<Q", data, off)[0]
+
+
+def _u40(data: bytes, off: int, big_endian: bool) -> int:
+    """A 5-byte integer, as the placement positions are stored."""
+    if off < 0 or off + 5 > len(data):
+        return -1
+    return int.from_bytes(data[off:off + 5], "big" if big_endian else "little")
 
 
 def _decode_triple(data: bytes, base: int, big_endian: bool = False):
@@ -264,27 +314,69 @@ def extract_regions(data: bytes, blocks, big_endian: bool,
 
 # --------------------------------------------------------------- playlists
 
-def extract_playlists(data: bytes, blocks, big_endian: bool) -> list[PlaylistEntry]:
-    """Decode playlist entries: which region sits on which track slot.
+def extract_playlists(data: bytes, blocks, big_endian: bool,
+                      regions: list[Region] | None = None
+                      ) -> list[PlaylistPlacement]:
+    """Decode the region->track map into timeline placements.
 
-    Reported for completeness; the mapping is not used by the library because
-    the placement fields are not established.
+    Walks ``0x1054`` -> ``0x1052`` (track) -> ``0x1050`` -> ``0x104f``. The
+    two fields that matter in a ``0x104f`` payload are the region index at
+    ``+2`` (u32) and the 40-bit position at ``+7``; byte ``+14`` says whether
+    the position is in samples (bit 6 clear) or ticks (bit 6 set).
+
+    The same region can be listed more than once, for example once per channel
+    of a multichannel track, so the result is a flat list of placements.
     """
     from .ptblocks import walk
 
-    out: list[PlaylistEntry] = []
-    for _, playlist in walk(blocks):
-        if playlist.content_type != PLAYLIST_TYPE:
+    by_index = {}
+    if regions:
+        by_index = {i: r for i, r in enumerate(regions)}
+
+    out: list[PlaylistPlacement] = []
+    for _, root in walk(blocks):
+        if root.content_type != PLAYLIST_MAP_TYPE:
             continue
-        for slot_index, slot in enumerate(playlist.children):
-            if slot.content_type != AUDIO_META_TYPE:
+        for playlist in root.children:
+            if playlist.content_type != PLAYLIST_TRACK_TYPE:
                 continue
-            for entry in slot.children:
-                idx = _u32(data, entry.payload_offset + 2, big_endian)
-                if 0 <= idx < 1_000_000:
-                    out.append(PlaylistEntry(track_index=slot_index,
-                                             region_index=idx,
-                                             block_offset=entry.offset))
+            track_name = _region_name(data, playlist.payload_offset + 2,
+                                      big_endian) or ""
+            for entry in playlist.children:
+                if entry.content_type != PLAYLIST_ENTRY_TYPE:
+                    continue
+                for sub in entry.children:
+                    if sub.content_type != PLAYLIST_SUBENTRY_TYPE:
+                        continue
+
+                    base = sub.payload_offset + 2
+                    index = _u32(data, base + 2, big_endian)
+                    position = _u40(data, base + 7, big_endian)
+                    if index < 0 or position < 0:
+                        continue
+
+                    flags = data[base + 14] if base + 14 < len(data) else 0
+                    if flags & 0x40:
+                        unit = TIMELINE_UNIT_TICKS
+                        start = None
+                        ticks = position - ZERO_TICKS
+                    else:
+                        unit = TIMELINE_UNIT_SAMPLES
+                        start = position
+                        ticks = None
+
+                    region = by_index.get(index)
+                    out.append(PlaylistPlacement(
+                        track_name=track_name,
+                        region_index=index,
+                        block_offset=sub.offset,
+                        position=position,
+                        playlist_offset=playlist.offset,
+                        unit=unit,
+                        region_name=region.name if region else "",
+                        timeline_start=start,
+                        timeline_ticks=ticks,
+                    ))
     return out
 
 

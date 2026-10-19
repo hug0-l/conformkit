@@ -143,11 +143,16 @@ print(summary)   # {'events': 128, 'tracks': 6, 'size': 1421312, ...}
 from conformkit.ptx import identify, read_session
 
 fmt = identify(open("session.ptx", "rb").read(), "session.ptx")
-print(fmt.kind, fmt.registry_id)          # PTX fmt/1727
+print(fmt.kind, fmt.pronom)               # PTX fmt/1727
 
 s = read_session("session.ptx")
 print(s.session_name, s.sample_rate, s.block_count)
 print(s.track_names[:5], s.plugins[:5])
+
+for r in s.regions[:5]:
+    # name and source are always right; timing carries a confidence rating
+    print(f"{r.name[:40]:<40} src={r.source_index} "
+          f"{r.length/48000:7.1f}s  {r.confidence}")
 ```
 
 Session writing is deliberately narrow: only **same-length name replacement on
@@ -170,7 +175,7 @@ print(report.summary())   # "5 renamed, verified"
 | AAFX 2.0 (XML) | yes | yes | dependency-free |
 | Binary AAF (OLE2) | container + names | yes (via pyaaf2) | objects keyed by SMPTE UL |
 | FCP7 XML (`xmeml`) | partial | no | sequence / clipitem / file |
-| Pro Tools session (PTX/PTF/PTS) | identification, decryption, block tree, names, embedded XML | name replacement only | AES-free XOR with a derived 256-byte key |
+| Pro Tools session (PTX/PTF/PTS) | identification, decryption, block tree, names, regions, embedded XML | name replacement only | AES-free XOR with a derived 256-byte key |
 | BWF / WAV | yes | no | `fmt `, `data`, `bext`, `iXML` |
 | MIDI (SMF type 1) | no | yes | markers, cues, punches, streamers |
 | PDF / text script | yes | n/a | PDF needs `pypdf` |
@@ -287,8 +292,12 @@ Everything is off the UI thread with progress reporting.
 - FCP7 XML import is partial; export is not implemented.
 - No DAW automation: re-conform produces a plan and a new list, and leaves
   applying it to the operator.
-- Session region timing is recovered for older format revisions only; newer
-  sessions expose names, sources and the block tree.
+- Session region **timing** is decoded with a confidence rating: about 23% of
+  records resolve unambiguously in a production Atmos session, 74% have more
+  than one plausible interpretation, and 3% none. Those records still carry
+  their name and source index. Nothing downstream relies on low-confidence
+  timing.
+- Region *names* and source indices are reliable for every record.
 
 ---
 

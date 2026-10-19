@@ -290,6 +290,7 @@ class PtxSession:
     big_endian: bool = False
     sample_rate: int = 0
     plugins: list = field(default_factory=list)
+    regions: list = field(default_factory=list)
 
     @property
     def string_count(self) -> int:
@@ -377,6 +378,15 @@ def read_session(path: str) -> PtxSession:
     # --- names from block payloads
     sess.track_names, sess.clip_names, sess.plugins = _names_from_blocks(
         plain, sess.blocks, sess.big_endian)
+
+    # --- region records: names and source indices are reliable, timing is
+    # best-effort and flagged per record
+    try:
+        from .ptregions import extract_regions
+
+        sess.regions = extract_regions(plain, sess.blocks, sess.big_endian)
+    except Exception:                               # noqa: BLE001
+        sess.regions = []
 
     # --- session metadata from the leading strings
     values = [t for _, t in sess.strings]

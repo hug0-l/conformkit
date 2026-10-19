@@ -32,6 +32,17 @@ def test_available_reports_status():
     assert isinstance(available(), bool)
 
 
+def test_trim_ends_removed():
+    """It never did anything; keeping it implied a behaviour that did not
+    exist. Callers write the list exactly as given."""
+    import inspect
+
+    from conformkit.aaf import place_clips
+
+    assert "trim_ends" not in inspect.signature(place_clips).parameters
+    assert "trim_ends" not in inspect.signature(write_binary_aaf).parameters
+
+
 def test_missing_dependency_message(monkeypatch):
     """Without pyaaf2 the error must tell the user what to install."""
     import conformkit.aafwrite as m

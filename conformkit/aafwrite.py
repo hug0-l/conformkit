@@ -1,9 +1,10 @@
 """Binary AAF writer.
 
 Uses pyaaf2 (the independent Python AAF SDK binding) to emit a real
-`OLE2`-container AAF that Pro Tools, Nuendo and Resolve can import. The AAFX
-writer in `conformkit.aaf` remains dependency-free for XML interchange; this
-module is the binary counterpart and is optional.
+`OLE2`-container AAF. Binary AAF is the interoperable route for applications
+that import AAF; the AAF-XML writer in `conformkit.aaf` remains dependency-free
+for XML stored-format interchange. This module is the binary counterpart and is
+optional.
 
 Structure produced:
 
@@ -54,13 +55,12 @@ def _rate_string_int(value: int) -> str:
 
 def write_binary_aaf(path: str, edit_list, rate,
                      title: str | None = None,
-                     sample_rate: int = 48000,
-                     trim_ends: bool = True) -> dict:
+                     sample_rate: int = 48000) -> dict:
     """Write an edit list as a binary AAF.
 
     Returns a summary dict with counts, so a caller can report what was written
-    without re-reading the file. `trim_ends` is accepted for API compatibility
-    and has no effect: events are written exactly as the list defines them.
+    without re-reading the file. Events are written exactly as the list defines
+    them.
     """
     try:
         import aaf2

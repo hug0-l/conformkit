@@ -22,11 +22,12 @@ Tech 3285, [MS-CFB], SMF) and validated against production material.
   parts of real-world EDLs that textbooks omit: dissolve pairs, zero-length
   anchors, CDL annotations, `REM` blocks.
 - **Any file can be identified** from its content, not its extension.
-- **Binary AAF** is written with a real AAF library, and the container is
-  readable without one.
+- **AAF-XML v1.1** is written in the AAF SDK's XML stored format and validated
+  against its reference schema; **binary AAF** is written with a real AAF
+  library, and the container is readable without one.
 - **Desktop UI** with a dense, keyboard-friendly list view and a fully modular
   command layer.
-- **456 tests**, including validation against production edit lists and a
+- **458 tests**, including validation against production edit lists and a
   third-party parser.
 
 ---
@@ -257,7 +258,7 @@ gives 100%. That assertion is in the test suite.
 | Format | Read | Write | Notes |
 |---|---|---|---|
 | CMX 3600 EDL | yes | yes | plus File16 / File32 / File129 |
-| AAFX (XML) | yes | yes | private simplified schema, not standards-conformant |
+| AAF-XML v1.1 | yes | yes | AAF SDK XML stored format, schema-validated; not a DAW interchange format |
 | Binary AAF (OLE2) | container + names | yes (via pyaaf2) | objects keyed by SMPTE UL |
 | FCP7 XML (`xmeml`) | partial | no | sequence / clipitem / file |
 | Pro Tools session (PTX/PTF/PTS) | identification, decryption, block tree, tracks, regions, audio files, embedded XML | name replacement only | AES-free XOR with a derived 256-byte key |
@@ -279,7 +280,7 @@ conformkit/
 ├── transforms.py   column text transform pipeline
 ├── compare.py      change list
 ├── match.py        roll / filename matching
-├── aaf.py          private AAF XML read/write, binary container identification
+├── aaf.py          AAF-XML v1.1 read/write, binary container identification
 ├── aafwrite.py     binary AAF via pyaaf2 (optional)
 ├── cfb.py          MS-CFB (OLE2) reader
 ├── conform.py      re-conform planning
@@ -321,7 +322,7 @@ python -m pytest tests -q
 ```
 
 ```
-415 passed, 1 skipped
+458 passed, 1 skipped
 ```
 
 What the suite actually proves:
@@ -349,6 +350,14 @@ What the suite actually proves:
 - **Transactional updates**: a mid-way failure leaves the list untouched.
 - **Safe session writes**: block count and file size unchanged, source
   byte-identical.
+
+AAF-XML output can be checked against the AAF SDK's reference schema. The
+validator downloads the schema at run time (it is not vendored) and needs
+`lxml`; the test suite itself needs neither:
+
+```bash
+python scripts/validate_aafxml.py out.aafx
+```
 
 Fixtures from third parties are not vendored:
 
@@ -381,10 +390,18 @@ Everything is off the UI thread with progress reporting.
 
 - Binary session writing is **name replacement only**; sessions are never
   synthesized.
-- Binary AAF export needs `pyaaf2`; AAFX is always available. AAFX here is a
-  private simplified XML schema that round-trips with conformkit only — it is
-  not standards-conformant AAF XML and is not claimed to be readable by other
-  tools.
+- Binary AAF export needs `pyaaf2`; AAF-XML is always available. The AAF-XML
+  writer implements the AAF SDK's XML stored format
+  (`http://www.aafassociation.org/aafx/v1.1/20050628`, root `<AAF
+  version="1.1">`) and is checked against the SDK reference schema by
+  `scripts/validate_aafxml.py`. **It is not claimed to be importable by Pro
+  Tools, Nuendo or Resolve.** AAF-XML is the SDK's XML representation, not the
+  interchange file those applications consume; binary AAF remains the
+  interoperable route.
+- Transitions are not serialised into AAF-XML. AAF `Transition` objects require
+  operation definitions that are file extensions rather than baseline
+  dictionary entries, so the writer does not fabricate them. Clips keep their
+  record and source timing, and `read_aafx` returns cuts.
 - FCP7 XML import is partial; export is not implemented.
 - No DAW automation: re-conform produces a plan and a new list, and leaves
   applying it to the operator.

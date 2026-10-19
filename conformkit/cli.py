@@ -330,7 +330,7 @@ def build_parser():
     s.add_argument("--dialect", default=None)
     s.set_defaults(func=cmd_info)
 
-    s = sub.add_parser("convert", help="convert between EDL and AAFX")
+    s = sub.add_parser("convert", help="convert between EDL and AAF-XML")
     s.add_argument("source")
     s.add_argument("dest")
     s.add_argument("--dialect", default=None)

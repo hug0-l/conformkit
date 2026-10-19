@@ -39,8 +39,10 @@ def test_cli_edl_to_aafx_to_edl(tmp_path):
     assert r.returncode == 0, r.stderr
     assert aafx.exists() and aafx.stat().st_size > 0
     text = aafx.read_text(encoding="utf-8")
-    assert "amwa.tv/aafx/v2.0" in text
+    assert "aafassociation.org/aafx/v1.1/20050628" in text
+    assert 'version="1.1"' in text
     assert "CompositionMob" in text
+    assert "SourceMob" in text
 
 
 def test_cli_compare_real_lists():

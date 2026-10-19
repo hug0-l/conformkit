@@ -21,7 +21,8 @@ and version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `start` triple is decoded with little-endian values, and each record carries
   a confidence rating. Validated against real audio, 100% of regions satisfy
   `sample_offset + length <= source length`; big-endian decoding satisfies only
-  about 22%, which pins the byte order.
+  about 22%, which pins the byte order. Records with no source length carry
+  `reliable=None` rather than an unchecked `True`.
 - Session audio-file metadata: sample rate, channel count, bit depth and
   length in samples, read from the `0x1001` records nested under `0x1003` and
   paired with names from `0x103A`.

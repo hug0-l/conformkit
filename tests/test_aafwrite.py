@@ -123,11 +123,13 @@ def test_zero_length_events_skipped(tmp_path):
     from conformkit.model import EditList
 
     src = sample_list()
-    zero = [e for e in src if e.rec_duration(R25) == 0]
     out = tmp_path / "z.aaf"
     summary = write_binary_aaf(str(out), src, R25)
-    # the writer must not emit clips for zero-length anchors
-    assert summary["events"] <= len(src)
+    # the writer must not emit clips for zero-length anchors: one event per
+    # non-zero event, not one per input event
+    expected = len([e for e in src if e.rec_duration(R25) > 0])
+    assert summary["events"] == expected
+    assert summary["events"] < len(src)
 
 
 @needs_aaf2

@@ -57,9 +57,49 @@ def test_smf_track_chunks_well_formed():
     assert chunks >= 2
 
 
+def _track_bodies(smf):
+    pos, out = 14, []
+    while pos + 8 <= len(smf):
+        n = struct.unpack(">I", smf[pos + 4:pos + 8])[0]
+        out.append(smf[pos + 8:pos + 8 + n])
+        pos += 8 + n
+    return out
+
+
+def _events(body):
+    """Yield (absolute_tick, status, payload) from a track body."""
+    i, tick = 0, 0
+    while i < len(body):
+        delta = 0
+        while True:
+            b = body[i]
+            i += 1
+            delta = (delta << 7) | (b & 0x7F)
+            if not b & 0x80:
+                break
+        tick += delta
+        status = body[i]
+        if status == 0xFF:
+            kind = body[i + 1]
+            i += 2
+            n = body[i]
+            i += 1
+            payload = body[i:i + n]
+            i += n
+            yield tick, 0xFF00 | kind, payload
+        elif status in (0x90, 0x80):
+            yield tick, status, body[i + 1:i + 3]
+            i += 3
+        else:
+            raise AssertionError(f"unexpected status 0x{status:02x}")
+
+
 def test_smf_ends_with_eot():
     smf = build_smf(el([ev()]), R25)
-    assert b"\xff\x2f\x00" in smf
+    tracks = _track_bodies(smf)
+    assert tracks
+    for body in tracks:
+        assert body.endswith(b"\xff\x2f\x00")
 
 
 def test_marker_track_has_names():
@@ -85,7 +125,11 @@ def test_ticks_are_monotonic():
     """Events must never produce a negative delta (VLQ cannot encode one)."""
     events = [ev(start=i * 200, roll=f"R{i}") for i in range(20)]
     smf = build_smf(el(events), R25)
-    assert smf[:4] == b"MThd"
+
+    markers = [tick for body in _track_bodies(smf)
+               for tick, status, _ in _events(body) if status == 0xFF06]
+    assert len(markers) == 20
+    assert all(b > a for a, b in zip(markers, markers[1:]))
 
 
 def test_frames_to_ticks_scales():

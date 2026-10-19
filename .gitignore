@@ -1,0 +1,29 @@
+# --- private fixtures: never committed ---
+fixtures/production/
+work/
+*.ptx
+*.ptf
+*.pts
+*.aaf
+
+# third-party EDL corpus (fetched by scripts/fetch_fixtures.sh)
+fixtures/*.edl
+
+# --- generated ---
+*.mid
+*.aafx
+gui_*.png
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# --- editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

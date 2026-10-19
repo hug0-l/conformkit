@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "conformkit"
+version = "0.1.0a1"
+description = "Edit-list and conform toolkit for film/TV sound post-production"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "conformkit contributors" }]
+keywords = ["edl", "cmx3600", "aaf", "bwf", "timecode", "conform", "assembly",
+            "post-production", "pro-tools", "dolby-atmos"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Video",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/hug0-l/conformkit"
+Source = "https://github.com/hug0-l/conformkit"
+Issues = "https://github.com/hug0-l/conformkit/issues"
+
+[project.optional-dependencies]
+pdf = ["pypdf>=4"]
+aaf = ["pyaaf2>=1.7"]
+dev = ["pytest>=8"]
+cross = ["pytest>=8", "pycmx>=1.5"]
+all = ["pypdf>=4", "pyaaf2>=1.7", "pytest>=8", "pycmx>=1.5"]
+
+[project.scripts]
+conformkit = "conformkit.cli:main"
+conformkit-gui = "conformkit.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["conformkit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning:conformkit.*"]

@@ -23,9 +23,13 @@ from conformkit.ptx import (
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "fixtures", "production")
 REAL_PTX = os.path.join(FIXTURE_DIR, "GP04_DSS1.ptx")
+LEGACY_DIR = os.path.join(os.path.dirname(__file__), "..", "fixtures", "ptx")
+ROCKBAND_PTS = os.path.join(LEGACY_DIR, "RockBand.pts")
 
 needs_real = pytest.mark.skipif(
     not os.path.exists(REAL_PTX), reason="production PTX fixture not present")
+needs_legacy = pytest.mark.skipif(
+    not os.path.exists(ROCKBAND_PTS), reason="legacy PTS fixture not present")
 
 
 # --------------------------------------------------------------- builders
@@ -178,6 +182,27 @@ def test_nested_dicts_are_balanced():
     assert len(docs) >= 1
     ET.fromstring(docs[0][1])
     assert b"</dict>" in docs[0][1]
+
+
+# --------------------------------------------------------------- legacy names
+
+@needs_legacy
+def test_legacy_audio_track_names_are_tracks():
+    """0x1014 is the audio track list; it must not be filed as a bus."""
+    s = read_session(ROCKBAND_PTS)
+    assert s.fmt.kind == "PTS"
+    assert len(s.track_names) == 15
+    assert s.track_names[:3] == ["Guitar Amp 1", "Guitar DI 1", "Guitar Amp 2"]
+
+
+@needs_legacy
+def test_legacy_io_names_are_buses():
+    """0x1021 is the I/O channel list, so its names belong in bus_names."""
+    s = read_session(ROCKBAND_PTS)
+    assert "Mesa Boogie" in s.bus_names
+    assert "A 1-2" in s.bus_names
+    assert "A 1-2" not in s.track_names
+    assert s.track_names and s.bus_names
 
 
 # --------------------------------------------------------------- real file

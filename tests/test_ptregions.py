@@ -14,7 +14,8 @@ from conformkit.ptblocks import parse_blocks
 from conformkit.ptdecrypt import decrypt
 from conformkit.ptregions import (
     AUDIO_FILE_LIST_TYPE, AUDIO_INFO_TYPE, AUDIO_META_TYPE, AUDIO_NAME_TYPE,
-    REGION_LIST_TYPES, REGION_TYPES, AudioFile, Region, RegionError,
+    PLAYLIST_MAP_TYPE, REGION_LIST_TYPES, REGION_TYPES, TIMELINE_UNIT_SAMPLES,
+    TIMELINE_UNIT_TICKS, ZERO_TICKS, AudioFile, Region, RegionError,
     extract_audio_files, extract_playlists, extract_regions,
     samples_to_timecode,
 )
@@ -22,6 +23,7 @@ from conformkit.timecode import rate_for
 
 PROD = os.path.join(os.path.dirname(__file__), "..", "fixtures", "production")
 PROD_PTX = os.path.join(PROD, "GP04_DSS1.ptx")
+LEGACY_DIR = os.path.join(os.path.dirname(__file__), "..", "fixtures", "ptx")
 DEMO_DIR = os.path.join(os.path.dirname(__file__), "..", "work", "lowroar")
 DEMO_PTX = os.path.join(DEMO_DIR, "Low Roar Pro Tools Demo.ptx")
 DEMO_AUDIO = os.path.join(DEMO_DIR, "audio")
@@ -50,6 +52,68 @@ def prod():
     plain, blocks, be = parse(PROD_PTX)
     files = extract_audio_files(plain, blocks, be)
     return plain, blocks, be, files, extract_regions(plain, blocks, be, files)
+
+
+# --------------------------------------------------------------- synthetic BE
+
+def _block(ctype, payload, body_type=0, big_endian=True):
+    """Build one block. `payload` is what follows the content-type field."""
+    fmt = ">" if big_endian else "<"
+    size = 2 + len(payload)
+    return (b"\x5a" + struct.pack(fmt + "H", body_type)
+            + struct.pack(fmt + "I", size) + struct.pack(fmt + "H", ctype)
+            + payload)
+
+
+def _pstr(text, big_endian=True):
+    raw = text.encode("ascii")
+    fmt = ">" if big_endian else "<"
+    return struct.pack(fmt + "I", len(raw)) + raw
+
+
+def _triple(values, big_endian=True, widths=(4, 4, 4)):
+    """Pack a region triple: widths at the endian-specific bytes, LE values."""
+    buf = bytearray(5 + sum(widths))
+    if big_endian:
+        buf[4] = widths[0] << 4
+        buf[3] = widths[1] << 4
+        buf[2] = widths[2] << 4
+    else:
+        buf[1] = widths[0] << 4
+        buf[2] = widths[1] << 4
+        buf[3] = widths[2] << 4
+    pos = 5
+    for value, width in zip(values, widths):
+        buf[pos:pos + width] = value.to_bytes(width, "little")
+        pos += width
+    return bytes(buf)
+
+
+def _be_region_tree(name="Kick-01", source=3, triple=(1000, 500, 2000)):
+    """A big-endian 0x262A -> 0x2629 -> 0x2628 tree with one region."""
+    name_blob = _pstr(name, True) + _triple(triple, True)
+    name_block = _block(0x2628, name_blob, body_type=3, big_endian=True)
+    record = _block(0x2629, name_block + struct.pack(">I", source),
+                    body_type=7, big_endian=True)
+    return _block(0x262A, record, body_type=1, big_endian=True)
+
+
+def _be_audio_tree(files=(("A.wav", 48000, 2, 24, 123456),
+                         ("B.wav", 96000, 1, 32, 654321))):
+    """A big-endian 0x1004 list with 0x103A names and 0x1003/0x1001 records."""
+    names = bytearray(b"\x00" * 5 + struct.pack(">I", len(files))
+                      + struct.pack(">I", 0))
+    for name, _, _, _, _ in files:
+        names += b"\x00" * 9 + _pstr(name, True)
+    name_block = _block(0x103A, bytes(names), body_type=1, big_endian=True)
+
+    records = b""
+    for _, rate, channels, bits, length in files:
+        info = (struct.pack(">I", rate) + bytes([channels, bits])
+                + struct.pack(">Q", length))
+        records += _block(0x1003, _block(0x1001, info, big_endian=True),
+                          body_type=1, big_endian=True)
+    return _block(0x1004, name_block + records, body_type=2, big_endian=True)
 
 
 def wav_frames(path):
@@ -85,6 +149,7 @@ def test_content_types():
     assert AUDIO_NAME_TYPE == 0x103A
     assert AUDIO_META_TYPE == 0x1003
     assert AUDIO_INFO_TYPE == 0x1001
+    assert PLAYLIST_MAP_TYPE == 0x1054
     assert 0x262A in REGION_LIST_TYPES and 0x2629 in REGION_TYPES
 
 
@@ -119,6 +184,46 @@ def test_decode_triple_rejects_bad_widths():
     data[1] = 0xF0
     assert _decode_triple(bytes(data), 0) is None
     assert _decode_triple(bytes(64), 0) is None
+
+
+# --------------------------------------------------------------- synthetic BE
+
+def test_big_endian_region_tree_end_to_end():
+    """A synthetic BE tree decodes through the real walker, not just the triple."""
+    data = _be_region_tree()
+    blocks = parse_blocks(data, start=0, big_endian=True)
+    regions = extract_regions(data, blocks, big_endian=True)
+
+    assert len(regions) == 1
+    r = regions[0]
+    assert (r.name, r.source_index) == ("Kick-01", 3)
+    assert (r.sample_offset, r.length, r.start) == (1000, 500, 2000)
+    assert r.end == 1500
+    assert r.reliable is None          # no source file supplied
+
+
+def test_big_endian_region_bound_is_checked():
+    data = _be_region_tree(triple=(1000, 500, 2000))
+    blocks = parse_blocks(data, start=0, big_endian=True)
+    files = [AudioFile(index=i) for i in range(3)] + [
+        AudioFile(index=3, name="src.wav", sample_rate=48000, length=1400)]
+    regions = extract_regions(data, blocks, big_endian=True, files=files)
+    assert regions[0].reliable is False       # 1500 > 1400
+
+    files[3].length = 1500
+    regions = extract_regions(data, blocks, big_endian=True, files=files)
+    assert regions[0].reliable is True
+
+
+def test_big_endian_audio_files_end_to_end():
+    data = _be_audio_tree()
+    blocks = parse_blocks(data, start=0, big_endian=True)
+    files = extract_audio_files(data, blocks, big_endian=True)
+
+    assert [f.name for f in files] == ["A.wav", "B.wav"]
+    assert [f.sample_rate for f in files] == [48000, 96000]
+    assert [(f.channels, f.bits) for f in files] == [(2, 24), (1, 32)]
+    assert [f.length for f in files] == [123456, 654321]
 
 
 # --------------------------------------------------------------- demo file
@@ -166,6 +271,113 @@ def test_demo_region_names_are_distinct(demo):
     _, _, _, _, regions = demo
     names = {r.name for r in regions}
     assert len(names) > len(regions) // 2
+
+
+# --------------------------------------------------------------- timeline
+
+@needs_demo
+def test_demo_placements_are_decoded(demo):
+    plain, blocks, be, _, regions = demo
+    placements = extract_playlists(plain, blocks, be, regions)
+
+    assert len(placements) == 286
+    assert all(0 <= p.region_index < len(regions) for p in placements)
+    assert all(p.region_name for p in placements), "every id resolves"
+
+    sample = [p for p in placements if p.unit == TIMELINE_UNIT_SAMPLES]
+    tick = [p for p in placements if p.unit == TIMELINE_UNIT_TICKS]
+    assert (len(sample), len(tick)) == (177, 109)
+
+    # A sample position must lie inside the session's audio extent.
+    extent = max(r.end for r in regions)
+    assert all(p.timeline_start is not None and p.timeline_start < extent
+               for p in sample)
+    # Tick positions are reported raw: no sample conversion is claimed.
+    assert all(p.timeline_start is None for p in tick)
+    assert all(p.timeline_ticks == p.position - ZERO_TICKS for p in tick)
+    assert all(p.timeline_ticks >= 0 for p in tick)
+
+
+@needs_demo
+def test_demo_placements_follow_the_source_order(demo):
+    """Split regions placed on one track keep their source order.
+
+    This is the evidence that the position field is a timeline coordinate and
+    not, say, another copy of the source offset: two pieces of one recording
+    appear in the same order they appear in the file, and for most pairs the
+    timeline gap equals the source gap.
+    """
+    plain, blocks, be, _, regions = demo
+    placements = extract_playlists(plain, blocks, be, regions)
+
+    by_track_source = {}
+    for p in placements:
+        if p.unit != TIMELINE_UNIT_SAMPLES:
+            continue
+        r = regions[p.region_index]
+        key = (p.track_name, r.source_index)
+        by_track_source.setdefault(key, set()).add(
+            (r.sample_offset, p.timeline_start))
+
+    pairs = ordered = exact = 0
+    for entries in by_track_source.values():
+        entries = sorted(entries)
+        for (off1, pos1), (off2, pos2) in zip(entries, entries[1:]):
+            if off1 == off2:
+                continue
+            pairs += 1
+            if pos1 <= pos2:
+                ordered += 1
+            if pos2 - pos1 == off2 - off1:
+                exact += 1
+
+    assert pairs >= 60
+    assert ordered / pairs >= 0.95, f"{ordered}/{pairs} keep source order"
+    assert exact / pairs >= 0.80, f"{exact}/{pairs} keep the exact gap"
+
+
+@needs_demo
+def test_demo_placements_are_monotonic_per_playlist(demo):
+    """Within one 0x1052 map entry, sample positions never go backwards.
+
+    Non-overlap is deliberately not asserted here: one map entry can carry
+    several channels or playlists, so clips that overlap in time are legitimate.
+    """
+    plain, blocks, be, _, regions = demo
+    placements = extract_playlists(plain, blocks, be, regions)
+    by_playlist = {}
+    for p in placements:
+        if p.unit == TIMELINE_UNIT_SAMPLES:
+            by_playlist.setdefault(p.playlist_offset, []).append(
+                (p.block_offset, p.timeline_start))
+
+    assert len(by_playlist) >= 30
+    for entries in by_playlist.values():
+        entries.sort()
+        assert all(entries[i][1] <= entries[i + 1][1]
+                   for i in range(len(entries) - 1))
+
+
+@needs_demo
+def test_demo_playlist_track_names_are_known_tracks():
+    from conformkit.ptx import read_session
+
+    s = read_session(DEMO_PTX)
+    names = {p.track_name for p in s.playlist_placements}
+    assert names
+    assert names <= set(s.track_names), sorted(names - set(s.track_names))
+
+
+@needs_demo
+def test_legacy_session_has_no_placements():
+    """0x1004 is the audio-file list, not a playlist: nothing should come out."""
+    path = os.path.join(LEGACY_DIR, "RockBand.pts")
+    if not os.path.exists(path):
+        pytest.skip("legacy PTS fixture not present")
+    plain, _ = decrypt(open(path, "rb").read())
+    be = bool(plain[0x11])
+    blocks = parse_blocks(plain, big_endian=be)
+    assert extract_playlists(plain, blocks, be) == []
 
 
 # --------------------------------------------------------------- prod file
@@ -250,6 +462,47 @@ def test_extraction_is_deterministic(prod):
 
 
 @needs_prod
-def test_playlists_do_not_crash(prod):
-    plain, blocks, be, _, _ = prod
-    assert isinstance(extract_playlists(plain, blocks, be), list)
+def test_prod_placements_are_decoded(prod):
+    plain, blocks, be, _, regions = prod
+    placements = extract_playlists(plain, blocks, be, regions)
+
+    assert len(placements) == 7325
+    assert all(p.unit == TIMELINE_UNIT_SAMPLES for p in placements)
+    resolved = [p for p in placements if 0 <= p.region_index < len(regions)]
+    assert len(resolved) == 7320        # five ids no longer resolve
+
+    extent = max(r.end for r in regions)
+    assert all(p.timeline_start < extent for p in resolved)
+
+
+@needs_prod
+def test_prod_placements_are_monotonic_per_playlist(prod):
+    plain, blocks, be, _, regions = prod
+    placements = extract_playlists(plain, blocks, be, regions)
+    by_playlist = {}
+    for p in placements:
+        by_playlist.setdefault(p.playlist_offset, []).append(
+            (p.block_offset, p.timeline_start))
+
+    ordered = 0
+    for entries in by_playlist.values():
+        entries.sort()
+        ordered += all(entries[i][1] <= entries[i + 1][1]
+                       for i in range(len(entries) - 1))
+
+    # Document order is a property of the file, not something we sort here.
+    assert ordered / len(by_playlist) >= 0.95
+
+
+@needs_prod
+def test_playlists_scan_the_map_not_the_audio_file_list(prod):
+    """The old implementation returned junk from 0x1004; the map is 0x1054."""
+    plain, blocks, be, _, regions = prod
+    placements = extract_playlists(plain, blocks, be, regions)
+    assert placements
+    assert all(p.block_offset for p in placements)
+    assert all(p.region_name for p in placements
+               if 0 <= p.region_index < len(regions))
+    # 0x1004 also appears in the session; it must not contribute placement
+    # records, or the count above would be far larger.
+    assert len(placements) < 10_000

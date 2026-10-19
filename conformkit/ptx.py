@@ -281,6 +281,7 @@ class PtxSession:
     working_path: str = ""
     track_names: list = field(default_factory=list)
     clip_names: list = field(default_factory=list)
+    bus_names: list = field(default_factory=list)
 
     # block tree
     blocks: list = field(default_factory=list)
@@ -292,6 +293,7 @@ class PtxSession:
     plugins: list = field(default_factory=list)
     regions: list = field(default_factory=list)
     audio_files: list = field(default_factory=list)
+    playlist_placements: list = field(default_factory=list)
 
     @property
     def string_count(self) -> int:
@@ -377,20 +379,23 @@ def read_session(path: str) -> PtxSession:
     sess.xml_documents = extract_xml_documents(plain)
 
     # --- names from block payloads
-    sess.track_names, sess.clip_names, sess.plugins = _names_from_blocks(
-        plain, sess.blocks, sess.big_endian)
+    sess.track_names, sess.clip_names, sess.plugins, sess.bus_names = \
+        _names_from_blocks(plain, sess.blocks, sess.big_endian)
 
     # --- region records: validated against the source file's real length
     try:
-        from .ptregions import extract_audio_files, extract_regions
+        from .ptregions import extract_audio_files, extract_playlists, extract_regions
 
         sess.audio_files = extract_audio_files(plain, sess.blocks,
                                                sess.big_endian)
         sess.regions = extract_regions(plain, sess.blocks, sess.big_endian,
                                        sess.audio_files)
+        sess.playlist_placements = extract_playlists(
+            plain, sess.blocks, sess.big_endian, sess.regions)
     except Exception:                               # noqa: BLE001
         sess.audio_files = []
         sess.regions = []
+        sess.playlist_placements = []
 
     # --- session metadata from the leading strings
     values = [t for _, t in sess.strings]
@@ -437,15 +442,15 @@ def read_session(path: str) -> PtxSession:
 
 # content types that carry a leading name, established empirically
 _NAME_CONTENT = {
-    0x251A: "track",     # track name
-    0x1021: "bus",       # bus / output name
-    0x2602: "bus",       # bus configuration name
+    0x251A: "track",     # audio/MIDI track name
+    0x1014: "track",     # audio track name (v5-v9 sessions, libptformat)
+    0x1052: "track",     # region->track map entry, carries the track name
+    0x1021: "bus",       # I/O channel entry
+    0x2602: "bus",       # bus / I/O route name
     0x2628: "clip",      # region / clip name
     0x210B: "marker",    # marker or memory location
     0x2423: "clip",      # alternate region list
     0x1017: "plugin",    # plug-in name
-    0x1014: "bus",
-    0x1052: "bus",
 }
 
 _NAME_OFFSETS = (0, 1, 2, 3, 4, 6, 8, 12)
@@ -471,15 +476,17 @@ def _pstring_at(data: bytes, off: int, big_endian: bool = False) -> str | None:
 
 
 def _names_from_blocks(data: bytes, blocks, big_endian: bool):
-    """Recover track, clip and plug-in names from block payloads."""
+    """Recover track, clip, plug-in and bus names from block payloads."""
     from .ptblocks import walk
 
     tracks: list[str] = []
     clips: list[str] = []
     plugins: list[str] = []
+    buses: list[str] = []
     seen_tracks: set[str] = set()
     seen_clips: set[str] = set()
     seen_plugins: set[str] = set()
+    seen_buses: set[str] = set()
 
     for _, b in walk(blocks):
         kind = _NAME_CONTENT.get(b.content_type)
@@ -505,5 +512,9 @@ def _names_from_blocks(data: bytes, blocks, big_endian: bool):
             if name not in seen_plugins:
                 seen_plugins.add(name)
                 plugins.append(name)
+        elif kind == "bus":
+            if name not in seen_buses:
+                seen_buses.add(name)
+                buses.append(name)
 
-    return tracks, clips, plugins
+    return tracks, clips, plugins, buses

@@ -147,12 +147,18 @@ print(fmt.kind, fmt.pronom)               # PTX fmt/1727
 
 s = read_session("session.ptx")
 print(s.session_name, s.sample_rate, s.block_count)
-print(s.track_names[:5], s.plugins[:5])
+print(s.track_names[:5], s.bus_names[:5], s.plugins[:5])
 
 for r in s.regions[:5]:
     # sample_offset and length are validated against the real source file
     print(f"{r.name[:40]:<40} src={r.source_index} "
           f"{r.duration_seconds:7.1f}s at offset {r.sample_offset:,}")
+
+# Where a region sits on the timeline. One region can be placed more than
+# once (multichannel tracks), so these are records, not a Region field.
+for p in s.playlist_placements[:5]:
+    print(f"{p.track_name:<24} {p.region_name[:32]:<32} "
+          f"start={p.timeline_start} {p.unit}")
 
 for f in s.audio_files[:5]:
     print(f"{f.name:<44} {f.length:>10,} samples "
@@ -199,6 +205,11 @@ length is `0x1001` nested under `0x1003`, in the same order.
          +8 u64 length in samples
 ```
 
+**Names.** `0x1014` is the audio track name list and `0x251A` the MIDI track
+name list, so both feed `PtxSession.track_names`. `0x1021` is the I/O channel
+list and `0x2602` the I/O route list, so their names feed `bus_names`. The
+legacy `.pts` files have no `0x251A`; their tracks come from `0x1014` only.
+
 **Regions.** Content type `0x2629` (or `0x1008`) inside `0x262A` (or `0x100B`).
 Name length is a u32 at `payload+11`, name bytes at `payload+15`. A packed
 triple follows: field widths are the high nibbles of the three bytes at
@@ -208,6 +219,33 @@ order `sample_offset, length, start`.
 The endianness is not a style choice — it is provable. Reading the triple
 big-endian leaves only 22% of regions inside their source file; little-endian
 gives 100%. That assertion is in the test suite.
+
+**Timeline placement.** The region records say *what* a region is; a separate
+map says *where* it is placed:
+
+```
+0x1054  full region->track map
+  0x1052  entry; track name is a u32-length string at +2
+    0x1050  one placement
+      0x104f  region index u32 at +2
+              position u40 at +7
+              unit byte at +14: bit 6 clear = samples, set = ticks
+```
+
+This layout is established for little-endian PTX v10+ sessions. The u32 at
+``+2`` indexes the region list in `0x2629` order: on the demo all 286 ids
+resolve and the resolved names match the clips on the track. Sample positions
+are plausible and checkable: every one is below the session's audio extent, and
+for split regions from one source placed on one track, timeline order follows
+source order in 97% of pairs and the exact source gap survives in 86% (demo
+session). A region may appear more than once — for example once per channel of
+a multichannel track — so placements are returned as `PlaylistPlacement`
+records rather than a single `Region.timeline_start`.
+
+Tick positions are the raw 40-bit value minus `ZERO_TICKS` (`0xE8D4A51000`).
+Turning ticks into samples needs the session tempo map; that is **not**
+implemented, so `timeline_start` stays `None` for those records and only
+`timeline_ticks` is set. Do not read them as samples.
 
 ---
 
@@ -219,7 +257,7 @@ gives 100%. That assertion is in the test suite.
 | AAFX (XML) | yes | yes | private simplified schema, not standards-conformant |
 | Binary AAF (OLE2) | container + names | yes (via pyaaf2) | objects keyed by SMPTE UL |
 | FCP7 XML (`xmeml`) | partial | no | sequence / clipitem / file |
-| Pro Tools session (PTX/PTF/PTS) | identification, decryption, block tree, tracks, regions, audio files, embedded XML | name replacement only | AES-free XOR with a derived 256-byte key |
+| Pro Tools session (PTX/PTF/PTS) | identification, decryption, block tree, tracks, buses, regions, timeline placements, audio files, embedded XML | name replacement only | AES-free XOR with a derived 256-byte key |
 | BWF / WAV | yes | no | `fmt `, `data`, `bext`, `iXML` |
 | MIDI (SMF type 1) | no | yes | markers, cues, punches, streamers |
 | PDF / text script | yes | n/a | PDF needs `pypdf` |
@@ -351,6 +389,9 @@ Everything is off the UI thread with progress reporting.
   `sample_offset + length` is checked against the real source-file length, and
   holds for 100% of records in both test sessions. `start` (the third packed
   value) is reported but its meaning is not established, so nothing uses it.
+  Timeline placement is decoded separately from the `0x1054` map; sample-unit
+  positions are validated against the session extent and source order, while
+  tick-unit positions are reported raw without a tempo-map conversion.
 - Session writing is **name replacement only**; sessions are never synthesized.
 
 ---

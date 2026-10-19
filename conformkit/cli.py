@@ -13,6 +13,7 @@ import argparse
 import os
 import sys
 
+from . import __version__
 from .aaf import AAFError, AafContainer, identify_aaf, write_aafx
 from .assembly import AssemblyError, build_assembly, most_common_rate, scan_wavs
 from .bwf import WavError, derive_roll_name, derive_start_timecode, read_wav_info
@@ -316,6 +317,8 @@ def cmd_gui(args):
 def build_parser():
     p = argparse.ArgumentParser(prog="conformkit", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
     p.add_argument("--encoding", default="utf-8",
                    help="text encoding for reading EDLs (default utf-8)")
     p.add_argument("--rate", default="25", choices=RATE_CHOICES,

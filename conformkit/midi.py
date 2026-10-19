@@ -12,6 +12,28 @@ used as the configuration surface:
 
 SMF is a published standard (MMA), so the container is written directly rather
 than through a library.
+
+Text cues
+---------
+``text_cue_track`` adds a separate track named ``text cues``. Each event
+produces a standard SMF text event (meta ``FF 01``, not a marker ``FF 06``) at
+that event's record-in position. The text is the clip name, prefixed with the
+same three-digit event number as the marker track when ``marker_name_index``
+is set.
+
+``text_cue_advance_seconds`` moves text events earlier by that many seconds,
+clamped at tick 0. The offset is a duration in the exported timeline and is
+converted at the file's tempo (120 bpm; 960 ticks per quarter, so 1920 ticks
+per second). It affects only the text-cue track. Negative values are rejected.
+
+Pull-down
+---------
+``add_pull_down`` interprets exported times at 1000/1001 of real time: every
+frame position is multiplied by 1000/1001 before it is converted to ticks, so
+24/30 fps material lands on the 23.976/29.97 grid. It applies uniformly to
+every generated track (markers, notes, punches, streamers and text cues) and
+leaves the conductor track and the edit list untouched. It is an export-time
+interpretation, not a change to the edit list.
 """
 from __future__ import annotations
 
@@ -23,6 +45,12 @@ __all__ = ["MidiSettings", "MidiEvent", "MidiTrack", "build_smf",
 
 
 TICKS_PER_QUARTER = 960
+
+# Export-time pull-down: 24 -> 23.976 and 30 -> 29.97 fps.
+_PULL_DOWN = 1000.0 / 1001.0
+
+# 120 bpm, so one second is two quarter notes.
+_TICKS_PER_SECOND = 2 * TICKS_PER_QUARTER
 
 
 @dataclass
@@ -110,11 +138,17 @@ def _track_chunk(track: MidiTrack) -> bytes:
     return b"MTrk" + struct.pack(">I", len(body)) + bytes(body)
 
 
-def frames_to_ticks(frames: int, rate) -> int:
-    """Convert frames to MIDI ticks using the true (real-time) frame rate."""
+def frames_to_ticks(frames: int, rate, pull_down: bool = False) -> int:
+    """Convert frames to MIDI ticks using the true (real-time) frame rate.
+
+    With ``pull_down`` the elapsed time is first scaled by 1000/1001, which
+    maps 24/30 fps positions onto the 23.976/29.97 grid.
+    """
     if frames <= 0:
         return 0
     seconds = frames / float(rate.actual)
+    if pull_down:
+        seconds *= _PULL_DOWN
     beats = seconds * 2.0                     # 120 bpm
     return int(round(beats * TICKS_PER_QUARTER))
 
@@ -131,6 +165,9 @@ def build_smf(edit_list, rate, settings: MidiSettings | None = None) -> bytes:
             raise ValueError(f"{label} must be 0..127, got {value!r}")
     if not 0 <= int(settings.streamer_channel) <= 15:
         raise ValueError("streamer_channel must be 0..15")
+    if not settings.text_cue_advance_seconds >= 0:
+        raise ValueError("text_cue_advance_seconds must be >= 0, "
+                         f"got {settings.text_cue_advance_seconds!r}")
 
     tracks: list[MidiTrack] = []
 
@@ -143,7 +180,8 @@ def build_smf(edit_list, rate, settings: MidiSettings | None = None) -> bytes:
     tracks.append(conductor)
 
     def track_ticks(ev) -> int:
-        return frames_to_ticks(_frames(ev.rec_in, rate), rate)
+        return frames_to_ticks(_frames(ev.rec_in, rate), rate,
+                               settings.add_pull_down)
 
     if settings.marker_track:
         tr = MidiTrack(name="markers")
@@ -164,7 +202,8 @@ def build_smf(edit_list, rate, settings: MidiSettings | None = None) -> bytes:
                 span = (_frames(ev.rec_out, rate) - _frames(ev.rec_in, rate))
             else:
                 span = settings.note_frames
-            length = frames_to_ticks(max(1, span), rate)
+            length = frames_to_ticks(max(1, span), rate,
+                                     settings.add_pull_down)
             tr.events.append(MidiEvent(start, "note_on",
                                        bytes([0x90, settings.note_number, 100])))
             tr.events.append(MidiEvent(start + length, "note_off",
@@ -175,7 +214,8 @@ def build_smf(edit_list, rate, settings: MidiSettings | None = None) -> bytes:
         tr = MidiTrack(name="punches")
         for ev in edit_list:
             start = track_ticks(ev)
-            length = frames_to_ticks(max(1, settings.punch_frames), rate)
+            length = frames_to_ticks(max(1, settings.punch_frames), rate,
+                                     settings.add_pull_down)
             tr.events.append(MidiEvent(start, "note_on",
                                        bytes([0x90, settings.punch_number, 110])))
             tr.events.append(MidiEvent(start + length, "note_off",
@@ -185,7 +225,8 @@ def build_smf(edit_list, rate, settings: MidiSettings | None = None) -> bytes:
     if settings.streamer_track:
         tr = MidiTrack(name="streamers")
         for ev in edit_list:
-            length = frames_to_ticks(max(1, settings.streamer_length_frames), rate)
+            length = frames_to_ticks(max(1, settings.streamer_length_frames),
+                                     rate, settings.add_pull_down)
             start = max(0, track_ticks(ev) - length)
             tr.events.append(MidiEvent(start, "note_on",
                                        bytes([0x90 | (settings.streamer_channel & 0x0F),
@@ -197,11 +238,15 @@ def build_smf(edit_list, rate, settings: MidiSettings | None = None) -> bytes:
 
     if settings.text_cue_track:
         tr = MidiTrack(name="text cues")
-        adv = int(settings.text_cue_advance_seconds * 2 * TICKS_PER_QUARTER)
+        advance = int(round(settings.text_cue_advance_seconds
+                            * _TICKS_PER_SECOND))
         for i, ev in enumerate(edit_list, start=1):
-            text = f"{i:03d} {ev.clip_name or ev.roll_name}"
-            tr.events.append(MidiEvent(max(0, track_ticks(ev) - adv), "text",
-                                       text.encode("utf-8", "replace")))
+            name = ev.clip_name or ev.roll_name
+            if settings.marker_name_index:
+                name = f"{i:03d} {name}"
+            tr.events.append(MidiEvent(max(0, track_ticks(ev) - advance),
+                                       "text",
+                                       name.encode("utf-8", "replace")))
         tracks.append(tr)
 
     header = b"MThd" + struct.pack(">IHHH", 6, 1, len(tracks), TICKS_PER_QUARTER)

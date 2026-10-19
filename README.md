@@ -24,7 +24,7 @@ Tech 3285, [MS-CFB], SMF) and validated against production material.
   readable without one.
 - **Desktop UI** with a dense, keyboard-friendly list view and a fully modular
   command layer.
-- **415 tests**, including validation against production edit lists and a
+- **456 tests**, including validation against production edit lists and a
   third-party parser.
 
 ---
@@ -128,6 +128,32 @@ if not problems:
         print(op.kind.value, op.delta, op.detail)
 ```
 
+### MIDI export
+
+```python
+from conformkit.midi import MidiSettings, write_midi
+
+settings = MidiSettings(
+    text_cue_track=True,
+    text_cue_advance_seconds=2.0,
+    add_pull_down=True,
+)
+write_midi("cues.mid", edit_list, rate, settings)
+```
+
+Type-1 SMF with the conductor track first and 960 ticks per quarter note.
+Markers, notes, punches, streamers and text cues each get their own track.
+
+- **Text cues** are standard SMF text events (`FF 01`) at each event's
+  record-in position, not markers. They carry the clip name, prefixed with the
+  three-digit event number when `marker_name_index` is set.
+- **`text_cue_advance_seconds`** moves text cues earlier, clamped at tick 0.
+  Only the text-cue track is affected; negative values are rejected.
+- **`add_pull_down`** interprets exported times at 1000/1001, so 24/30 fps
+  material lands on the 23.976/29.97 grid. Every generated track uses that
+  scale consistently. It is an export-time interpretation: the edit list is
+  not modified.
+
 ### Binary AAF
 
 ```python
@@ -221,7 +247,7 @@ gives 100%. That assertion is in the test suite.
 | FCP7 XML (`xmeml`) | partial | no | sequence / clipitem / file |
 | Pro Tools session (PTX/PTF/PTS) | identification, decryption, block tree, tracks, regions, audio files, embedded XML | name replacement only | AES-free XOR with a derived 256-byte key |
 | BWF / WAV | yes | no | `fmt `, `data`, `bext`, `iXML` |
-| MIDI (SMF type 1) | no | yes | markers, cues, punches, streamers |
+| MIDI (SMF type 1) | no | yes | markers, cues, punches, streamers, text cues |
 | PDF / text script | yes | n/a | PDF needs `pypdf` |
 | Delimited text | yes | yes | tab and CSV |
 

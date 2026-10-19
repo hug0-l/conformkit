@@ -27,7 +27,7 @@ Tech 3285, [MS-CFB], SMF) and validated against production material.
   library, and the container is readable without one.
 - **Desktop UI** with a dense, keyboard-friendly list view and a fully modular
   command layer.
-- **458 tests**, including validation against production edit lists and a
+- **482 tests**, including validation against production edit lists and a
   third-party parser.
 
 ---
